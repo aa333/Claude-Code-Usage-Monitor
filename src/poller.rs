@@ -19,13 +19,20 @@ pub enum PollError {
 }
 
 pub fn poll() -> Result<UsageData, PollError> {
-    let mut creds = read_credentials().ok_or(PollError::NoCredentials)?;
+    let mut creds = match read_credentials() {
+        Some(c) => c,
+        None => return Err(PollError::NoCredentials),
+    };
 
     if is_token_expired(creds.expires_at) {
-        // Token expired — ask the Claude CLI to refresh its own credentials
         cli_refresh_token();
-        // Re-read the credentials file after CLI refresh
-        creds = read_credentials().ok_or(PollError::NoCredentials)?;
+
+        // Re-read credentials in case the CLI refreshed them
+        match read_credentials() {
+            Some(refreshed) => creds = refreshed,
+            None => return Err(PollError::NoCredentials),
+        }
+
         if is_token_expired(creds.expires_at) {
             return Err(PollError::TokenExpired);
         }
@@ -34,15 +41,70 @@ pub fn poll() -> Result<UsageData, PollError> {
     fetch_usage_with_fallback(&creds.access_token)
 }
 
-/// Invoke the Claude CLI to trigger its internal token refresh.
-/// `claude auth status` checks auth state, which causes the CLI to
-/// refresh expired tokens and write updated credentials to disk.
+/// Invoke the Claude CLI with a minimal prompt to force its internal
+/// OAuth token refresh.  `claude -p "."` makes the CLI
+/// authenticate (refreshing the access token if expired), perform a
+/// tiny API call, and exit — updating the credentials file on disk.
 fn cli_refresh_token() {
-    let _ = Command::new("claude")
-        .args(["auth", "status"])
+    let claude_path = resolve_claude_path();
+    let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
+
+    let args: &[&str] = &["-p", "."];
+
+    // Clear env vars that prevent nested Claude Code sessions
+    let mut cmd = if is_cmd {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(&claude_path).args(args);
+        c
+    } else {
+        let mut c = Command::new(&claude_path);
+        c.args(args);
+        c
+    };
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+
+    let _ = cmd.status();
+}
+
+/// Resolve the full path to the `claude` CLI executable.
+/// First tries the bare command name (works if on PATH), then falls back
+/// to `where.exe claude` which searches the system/user PATH from the
+/// registry — important for processes started via the Windows Run key
+/// that may not inherit the full shell PATH.
+fn resolve_claude_path() -> String {
+    // Quick check: try claude.cmd first (Windows npm wrapper), then bare "claude"
+    for name in &["claude.cmd", "claude"] {
+        if Command::new(name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return name.to_string();
+        }
+    }
+
+    // Use where.exe to search the system/user PATH from the registry.
+    // Try claude.cmd first (the Windows batch wrapper npm creates).
+    for name in &["claude.cmd", "claude"] {
+        if let Ok(output) = Command::new("where.exe").arg(name).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = stdout.lines().next() {
+                    let path = first_line.trim().to_string();
+                    if !path.is_empty() {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+
+    "claude.cmd".to_string()
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
@@ -68,9 +130,12 @@ fn read_credentials() -> Option<Credentials> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let oauth = json.get("claudeAiOauth")?;
+    let access_token = oauth.get("accessToken").and_then(|v| v.as_str())?.to_string();
+    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+
     Some(Credentials {
-        access_token: oauth.get("accessToken")?.as_str()?.to_string(),
-        expires_at: oauth.get("expiresAt").and_then(|v| v.as_i64()),
+        access_token,
+        expires_at,
     })
 }
 
@@ -84,12 +149,10 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 fn try_model(token: &str, model: &str) -> Option<UsageData> {
-    let tls = std::sync::Arc::new(
-        native_tls::TlsConnector::new().ok()?
-    );
+    let tls = native_tls::TlsConnector::new().ok()?;
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
-        .tls_connector(tls)
+        .tls_connector(std::sync::Arc::new(tls))
         .build();
 
     let body = serde_json::json!({
@@ -106,13 +169,15 @@ fn try_model(token: &str, model: &str) -> Option<UsageData> {
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(_, resp)) => resp,
+        Err(ureq::Error::Status(_code, resp)) => resp,
         Err(_) => return None,
     };
 
-    let has_rate_limit_headers = response.header("anthropic-ratelimit-unified-5h-utilization").is_some()
-        || response.header("anthropic-ratelimit-unified-7d-utilization").is_some()
-        || response.header("anthropic-ratelimit-unified-status").is_some();
+    let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
+    let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
+    let hs = response.header("anthropic-ratelimit-unified-status");
+
+    let has_rate_limit_headers = h5.is_some() || h7.is_some() || hs.is_some();
 
     if has_rate_limit_headers {
         Some(parse_headers(&response))

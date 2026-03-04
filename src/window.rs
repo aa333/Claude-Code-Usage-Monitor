@@ -78,6 +78,7 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
 
+/// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
     unsafe {
         let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
@@ -95,6 +96,7 @@ fn is_startup_enabled() -> bool {
             return false;
         }
 
+        // Query the size of the value
         let mut data_size: u32 = 0;
         let result = RegQueryValueExW(
             hkey,
@@ -104,8 +106,45 @@ fn is_startup_enabled() -> bool {
             None,
             Some(&mut data_size),
         );
+        if result.is_err() || data_size == 0 {
+            let _ = RegCloseKey(hkey);
+            return false;
+        }
+
+        // Read the value
+        let mut buf = vec![0u8; data_size as usize];
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR::from_raw(key_name.as_ptr()),
+            None,
+            None,
+            Some(buf.as_mut_ptr()),
+            Some(&mut data_size),
+        );
         let _ = RegCloseKey(hkey);
-        result.is_ok()
+        if result.is_err() {
+            return false;
+        }
+
+        // Convert the registry value (UTF-16) to a string
+        let wide_slice = std::slice::from_raw_parts(
+            buf.as_ptr() as *const u16,
+            data_size as usize / 2,
+        );
+        let reg_value = String::from_utf16_lossy(wide_slice)
+            .trim_end_matches('\0')
+            .to_string();
+
+        // Get the current executable path
+        let mut exe_buf = [0u16; 260];
+        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
+        if len == 0 {
+            return false;
+        }
+        let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
+
+        // Case-insensitive comparison (Windows paths are case-insensitive)
+        reg_value.eq_ignore_ascii_case(&current_exe)
     }
 }
 
@@ -164,7 +203,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 52;
+const TEXT_WIDTH: i32 = 62;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
@@ -597,7 +636,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                     1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
                 );
                 let retry_ms = backoff.min(s.poll_interval_ms);
+
                 unsafe {
+                    // Kill the 5-second reset poll so it doesn't bypass backoff
+                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
                     SetTimer(hwnd, TIMER_POLL, retry_ms, None);
                 }
             }
