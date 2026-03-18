@@ -49,6 +49,7 @@ Run the executable — the widget appears in your taskbar.
 
 - **Drag** the left divider to reposition the widget along the taskbar
 - **Right-click** for a context menu with **Refresh**, **Update Frequency**, **Settings** (Start with Windows, Reset Position), and **Exit**
+- Installations managed by WinGet defer upgrades to `winget upgrade` instead of replacing the executable in place
 
 ## Project structure
 
@@ -66,9 +67,7 @@ src/
 
 Pre-built Windows executables are available on the [Releases](../../releases) page. Download `claude-code-usage-monitor.exe` and run it directly — no Rust toolchain required.
 
-New releases are published automatically when a version tag is pushed:
+After the GitHub Release is published, the release workflow also attempts to submit a WinGet manifest update for `CodeZeno.ClaudeCodeUsageMonitor`.
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+- Configure a classic PAT as the `WINGETCREATE_GITHUB_TOKEN` repository secret with `public_repo` scope so `wingetcreate` can submit to `microsoft/winget-pkgs`
+- The first WinGet submission still needs to be created manually; after the package exists, later tagged releases can update it automatically

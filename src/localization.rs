@@ -275,6 +275,16 @@ pub fn detect_system_language() -> LanguageId {
         .unwrap_or(LanguageId::English)
 }
 
+pub fn update_via_winget(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::English => "Update via WinGet",
+        LanguageId::Spanish => "Actualizar con WinGet",
+        LanguageId::French => "Mettre a jour avec WinGet",
+        LanguageId::German => "Mit WinGet aktualisieren",
+        LanguageId::Japanese => "WinGet",
+    }
+}
+
 fn preferred_ui_languages() -> Vec<String> {
     unsafe {
         let mut num_languages = 0u32;

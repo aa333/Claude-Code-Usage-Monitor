@@ -17,6 +17,15 @@ const RELEASE_ASSET_NAME: &str = "claude-code-usage-monitor.exe";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+// Keep this aligned with the package identifier used in winget-pkgs.
+const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallChannel {
+    Portable,
+    Winget,
+}
 
 #[derive(Clone, Debug)]
 pub struct ReleaseDescriptor {
@@ -60,11 +69,32 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
     None
 }
 
+pub fn current_install_channel() -> InstallChannel {
+    match std::env::current_exe() {
+        Ok(path) if is_winget_install_path(&path) => InstallChannel::Winget,
+        _ => InstallChannel::Portable,
+    }
+}
+
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
     match fetch_latest_release()? {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
     }
+}
+
+pub fn begin_winget_update() -> Result<(), String> {
+    let command = winget_upgrade_command();
+    Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoExit")
+        .arg("-Command")
+        .arg(&command)
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
+
+    Ok(())
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
@@ -305,6 +335,10 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
+fn winget_upgrade_command() -> String {
+    format!("winget upgrade --id {WINGET_PACKAGE_ID} --exact")
+}
+
 fn backup_path_for(target: &Path) -> PathBuf {
     let file_name = target
         .file_name()
@@ -348,6 +382,52 @@ fn github_repo() -> Result<(&'static str, &'static str), String> {
 
 fn user_agent() -> &'static str {
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
+}
+
+fn is_winget_install_path(path: &Path) -> bool {
+    let normalized_path = normalize_path(path);
+    winget_install_roots()
+        .into_iter()
+        .map(|root| normalize_path(&root))
+        .any(|root| normalized_path.starts_with(&root))
+}
+
+fn winget_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        roots.push(
+            PathBuf::from(local_app_data)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Packages"),
+        );
+    }
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(program_files).join("WinGet").join("Packages"));
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files\WinGet\Packages"));
+    }
+
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        roots.push(
+            PathBuf::from(program_files_x86)
+                .join("WinGet")
+                .join("Packages"),
+        );
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files (x86)\WinGet\Packages"));
+    }
+
+    roots
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn is_version_newer(candidate: &str, current: &str) -> bool {
